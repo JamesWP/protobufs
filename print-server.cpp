@@ -1,10 +1,47 @@
+
 #include <boost/asio.hpp>
 #include <boost/program_options.hpp>
+#include <google/protobuf/message.h>
+
+#include "proto.pb.h"
+
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <utility>
 #include <vector>
+
+template <std::size_t buffer_len>
+struct membuf : std::streambuf {
+    static constexpr std::size_t k_buffer_len = buffer_len;
+
+    const std::vector<const char *>& d_buffers;
+    std::size_t                      d_current_buffer;
+
+    membuf(const std::vector<const char *> buffers)
+    : d_buffers{buffers}
+    , d_current_buffer{0}
+    {
+        if (d_current_buffer < d_buffers.size()) {
+            char *p(const_cast<char *>(d_buffers[d_current_buffer]));
+            this->setg(p, p, p + k_buffer_len); 
+        }
+    }
+protected:
+  int underflow()
+  {
+      d_current_buffer++;
+
+      if (d_current_buffer < d_buffers.size()) {
+          char *p(const_cast<char *>(d_buffers[d_current_buffer]));
+          this->setg(p, p, p + k_buffer_len);
+          return *p;
+      }
+      else {
+          return EOF;
+      }
+  }
+};
 
 using boost::asio::ip::tcp;
 namespace po = boost::program_options;
@@ -79,23 +116,73 @@ class session : public std::enable_shared_from_this<session> {
             if (!ec) {
                 std::cout << "read " << len << " bytes\n";
                 d_next_pos += len;
-                if (d_next_pos / k_buffer_len > d_buffers.size() - 1) {
-                    d_buffers.emplace_back(new char[k_buffer_len]);
+
+                while(d_message_start < d_next_pos) {              
+
+                  if (d_next_pos - d_message_start < sizeof(std::uint64_t)) {
+                      this->do_read_msg();
+                      return;
+                  }
+
+                  std::uint64_t payload_length = this->get_payload_length();
+                  std::cout << "payload_length = " << payload_length << '\n';
+
+                  if (d_next_pos - d_message_start < payload_length) {
+                      this->do_read_msg();
+                      std::cout << "awaiting more of the message\n";
+                      return;
+                  }
+
+                  std::cout << "got full message\n";
+
+                  std::vector<const char*> buffers;
+                  buffers.reserve(d_buffers.size());
+
+                  std::transform(d_buffers.begin(), 
+                                 d_buffers.end(), 
+                                 std::back_inserter(buffers), 
+                                 [](const std::unique_ptr<char>& buffer)
+                                 { return const_cast<const char*>(buffer.get()); });
+
+                  membuf<k_buffer_len> message_body_buffer(buffers);
+
+                  std::istream message_body_stream(&message_body_buffer);
+                  
+                  // skip to start of payload in stream
+                  message_body_stream.ignore(d_message_start +
+                                             sizeof(std::uint64_t));
+
+                  tutorial::Person read_person;
+
+                  read_person.ParseFromIstream(&message_body_stream);
+
+                  read_person.PrintDebugString(); 
+
+                  // setup for next message read
+                  
+                  if (d_next_pos / k_buffer_len != 0) {
+                      // we finished in a non first buffer, lets make it first
+                      std::swap(d_buffers[d_next_pos / k_buffer_len] ,
+                                d_buffers[0]);
+
+                      d_next_pos = d_next_pos % k_buffer_len;
+                  }
+
+                  d_message_start += sizeof(std::uint64_t) + payload_length;
                 }
-                if (d_next_pos < sizeof(std::uint64_t)) {
-                   this->do_read_msg();
-                   return;
-                }
-                std::uint64_t payload_length = this->get_payload_length();
-                std::cout << "payload_length = " << payload_length << '\n';
-                if (d_next_pos - d_message_start < payload_length) {
-                    this->do_read_msg();
-                    std::cout << "awaiting more of the message\n";
-                    return;
-                }
-                std::cout << "got full message\n";
+
+                this->do_read_msg();
+                return;
             }
         };
+
+        // ensure space is there for next read
+        if (d_next_pos / k_buffer_len > d_buffers.size() - 1) {
+            std::cout << "Filled buffer " << d_next_pos / k_buffer_len
+                      << " allocating another \n";
+
+            d_buffers.emplace_back(new char[k_buffer_len]);
+        }
 
         d_socket.async_read_some(
                boost::asio::buffer(get_read_buffer(), get_remaining_space()) ,
@@ -149,23 +236,25 @@ public:
     boost::asio::connect(d_socket, resolver.resolve(hostname, port));
   }
   
-  void send()
+  void send(const google::protobuf::Message& message)
   {
-      std::uint64_t  length = 1234;
+      std::ostringstream outputPayload;      
+    
+      message.SerializeToOstream(&outputPayload);
+      
+      message.PrintDebugString();      
+
+
+      std::uint64_t  length = outputPayload.str().size();
       std::uint64_t  n_length = htobe64(length);  // host to big endian 64 bit
       char         *request  = reinterpret_cast<char *>(&n_length);
       std::size_t   request_len = sizeof(n_length);
-      
-      boost::asio::write(d_socket, boost::asio::buffer(request, request_len));
 
-      char          payload[length];
+      std::array<boost::asio::const_buffer, 2> message_buffer = {
+          boost::asio::const_buffer{request, request_len},
+          boost::asio::const_buffer{outputPayload.str().c_str(), length}};
 
-      std::uint8_t i = 0;
-      for (char *cur = payload; cur < payload + length; cur++) {
-          *cur = i;
-      }
-
-      boost::asio::write(d_socket, boost::asio::buffer(payload, length));
+      boost::asio::write(d_socket, message_buffer);
   }
 };
 
@@ -176,6 +265,7 @@ int main(int argc, char *argv[])
     desc.add_options()("hostname", po::value<std::string>(), "name to use when connecting");
     desc.add_options()("port", po::value<std::string>(), "port to listen / connect with");
     desc.add_options()("mode", po::value<int>(), "mode: server == 0, client == 1");
+    desc.add_options()("messages", po::value<int>(), "number of messages");
 
     po::variables_map args;
     try {
@@ -194,6 +284,7 @@ int main(int argc, char *argv[])
     std::string port     = "4242";
     std::string hostname = "localhost";
     int         mode     = 0;
+    int         messages = 1;
 
     if (args.count("port")) {
         port = args["port"].as<short>();
@@ -203,6 +294,9 @@ int main(int argc, char *argv[])
     }
     if (args.count("mode")) {
         mode = args["mode"].as<int>();
+    }
+    if (args.count("messages")) {
+        messages = args["messages"].as<int>();
     }
 
     try {
@@ -214,7 +308,9 @@ int main(int argc, char *argv[])
         }
         else if (mode == 1) {
             client c(io_context, hostname, port);
-            c.send(); 
+            tutorial::Person person;
+            person.set_name("Jimbo Wilkins Preist");
+            for (int i = 0; i < messages; i++) { c.send(person); } 
             io_context.run();
         }
     }
